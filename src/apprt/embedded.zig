@@ -404,6 +404,13 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+pub const IoMode = enum(c_int) {
+    exec = 0,
+    manual = 1,
+};
+
+pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -413,6 +420,9 @@ pub const Surface = struct {
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
+    io_mode: IoMode = .exec,
+    io_write_cb: ?IoWriteCallback = null,
+    io_write_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -459,6 +469,15 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// IO mode for the surface.
+        io_mode: IoMode = .exec,
+
+        /// Callback invoked when Ghostty wants to write to the backend.
+        io_write_cb: ?IoWriteCallback = null,
+
+        /// Userdata passed to io_write_cb.
+        io_write_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -473,6 +492,9 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .io_mode = opts.io_mode,
+            .io_write_cb = opts.io_write_cb,
+            .io_write_userdata = opts.io_write_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -625,6 +647,18 @@ pub const Surface = struct {
 
     pub fn rtApp(self: *const Surface) *App {
         return self.app;
+    }
+
+    pub fn ioMode(self: *const Surface) IoMode {
+        return self.io_mode;
+    }
+
+    pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
+        return self.io_write_cb;
+    }
+
+    pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
+        return self.io_write_userdata;
     }
 
     pub fn close(self: *const Surface, process_alive: bool) void {
@@ -921,6 +955,9 @@ pub const Surface = struct {
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
+            .io_mode = self.io_mode,
+            .io_write_cb = self.io_write_cb,
+            .io_write_userdata = self.io_write_userdata,
         };
     }
 
@@ -1788,6 +1825,16 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+    }
+
+    /// Process output bytes as if they were read from the PTY.
+    export fn ghostty_surface_process_output(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
     /// Returns true if the surface currently has mouse capturing
