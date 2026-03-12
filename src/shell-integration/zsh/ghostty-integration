@@ -149,8 +149,12 @@ _ghostty_deferred_init() {
                 [[ $PS1 == *$mark1* ]] || PS1=${mark1}${PS1}
                 [[ $PS1 == *$markB* ]] || PS1=${PS1}${markB}
                 # Handle multiline prompts by marking newline-separated
-                # continuation lines with k=s (mark2).
-                if [[ $PS1 == ${mark1}$'\n'* ]]; then
+                # continuation lines with k=s (mark2). Prompts like Pure use
+                # \n%{\r%} to move the cursor back to column 0, so the
+                # continuation mark has to sit after that non-printing CR.
+                if [[ $PS1 == *$'\n%{\r%}'* ]]; then
+                    PS1=${PS1//$'\n%{\r%}'/$'\n%{\r%}'${mark2}}
+                elif [[ $PS1 == ${mark1}$'\n'* ]]; then
                     builtin local rest=${PS1#${mark1}$'\n'}
                     if [[ $rest == *$'\n'* ]]; then
                         PS1=${mark1}$'\n'${rest//$'\n'/$'\n'${mark2}}
