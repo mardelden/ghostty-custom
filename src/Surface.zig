@@ -4526,12 +4526,19 @@ fn linkAtPin(
     }) orelse return null;
 
     var strmap: terminal.StringMap = undefined;
-    self.alloc.free(try screen.selectionString(self.alloc, .{
+    const str = try screen.selectionString(self.alloc, .{
         .sel = line,
         .trim = false,
         .map = &strmap,
-    }));
+    });
+    const str_len = str.len;
+    self.alloc.free(str);
     defer strmap.deinit(self.alloc);
+
+    // Skip regex on very long lines to avoid O(n²) stalls in the
+    // Oniguruma engine. No clickable URL exists in a 10K+ char
+    // unbroken line. See docs/plans/2026-03-14-cmd-delete-freeze-fix.md.
+    if (str_len > 10_000) return null;
 
     for (self.config.links) |link| {
         // Skip highlight/mods check when mouse_mods is null (double-click mode)
