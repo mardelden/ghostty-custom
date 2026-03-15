@@ -1707,6 +1707,52 @@ fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
     };
 }
 
+/// Fold rows [start_row, end_row) — hide them from the viewport and
+/// adjust the scrollbar. Called by the app runtime to collapse large output.
+pub fn foldRows(self: *Surface, start_row: u64, end_row: u64) void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        t.screens.active.addFold(
+            @intCast(start_row),
+            @intCast(end_row),
+        ) catch |err| {
+            log.warn("failed to add fold region err={}", .{err});
+            return;
+        };
+    }
+
+    self.queueRender() catch {};
+}
+
+/// Unfold rows [start_row, end_row) — restore them to the viewport.
+pub fn unfoldRows(self: *Surface, start_row: u64, end_row: u64) void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        t.screens.active.removeFold(
+            @intCast(start_row),
+            @intCast(end_row),
+        );
+    }
+
+    self.queueRender() catch {};
+}
+
+/// Unfold all fold regions.
+pub fn unfoldAll(self: *Surface) void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        t.screens.active.clearFolds();
+    }
+
+    self.queueRender() catch {};
+}
+
 /// This should be called anytime `config_conditional_state` changes
 /// so that the apprt can reload the configuration.
 fn notifyConfigConditionalState(self: *Surface) void {
@@ -4115,10 +4161,13 @@ pub fn mouseButtonCallback(
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
             const pt_viewport = self.posToViewport(pos.x, pos.y);
+            // Adjust y for fold regions: visual row may differ from physical
+            // row when folded rows are hidden in the viewport.
+            const physical_y = screen.viewportVisualToPhysical(pt_viewport.y);
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
-                    .y = pt_viewport.y,
+                    .y = @intCast(physical_y),
                 },
             }) orelse {
                 // Weird... our viewport x/y that we just converted isn't
@@ -4873,12 +4922,13 @@ pub fn cursorPosCallback(
             );
         }
 
-        // Convert to points
+        // Convert to points, adjusting for fold regions
         const screen: *terminal.Screen = t.screens.active;
+        const physical_y = screen.viewportVisualToPhysical(pos_vp.y);
         const pin = screen.pages.pin(.{
             .viewport = .{
                 .x = pos_vp.x,
-                .y = pos_vp.y,
+                .y = @intCast(physical_y),
             },
         }) orelse {
             if (comptime std.debug.runtime_safety) unreachable;

@@ -2983,7 +2983,7 @@ pub fn scrollbar(self: *PageList) Scrollbar {
 /// will traverse a lot of linked list nodes.
 ///
 /// The result is cached so repeated calls are cheap.
-fn viewportRowOffset(self: *PageList) usize {
+pub fn viewportRowOffset(self: *PageList) usize {
     return switch (self.viewport) {
         .top => 0,
         .active => self.total_rows - self.rows,

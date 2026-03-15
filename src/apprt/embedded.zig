@@ -2066,6 +2066,29 @@ pub const CAPI = struct {
         ptr.freeInspector();
     }
 
+    /// Fold rows [start_row, end_row) — hide from viewport/scrollbar.
+    export fn ghostty_surface_fold_rows(
+        ptr: *Surface,
+        start_row: u64,
+        end_row: u64,
+    ) void {
+        ptr.core_surface.foldRows(start_row, end_row);
+    }
+
+    /// Unfold rows [start_row, end_row) — restore to viewport.
+    export fn ghostty_surface_unfold_rows(
+        ptr: *Surface,
+        start_row: u64,
+        end_row: u64,
+    ) void {
+        ptr.core_surface.unfoldRows(start_row, end_row);
+    }
+
+    /// Unfold all fold regions.
+    export fn ghostty_surface_unfold_all(ptr: *Surface) void {
+        ptr.core_surface.unfoldAll();
+    }
+
     export fn ghostty_inspector_set_size(ptr: *Inspector, w: u32, h: u32) void {
         ptr.updateSize(w, h);
     }

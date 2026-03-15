@@ -1229,7 +1229,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // naturally limits the number of calls to this method (it
                 // can be expensive) and also makes it so we don't need another
                 // cross-thread mailbox message within the IO path.
-                const scrollbar = state.terminal.screens.active.pages.scrollbar();
+                const scrollbar = state.terminal.screens.active.foldAdjustedScrollbar();
 
                 // Get our preedit state
                 const preedit: ?renderer.State.Preedit = preedit: {

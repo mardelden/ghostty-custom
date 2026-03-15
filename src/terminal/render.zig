@@ -392,15 +392,39 @@ pub const RenderState = struct {
         // more quickly do the full-page dirty check.
         var last_dirty_page: ?*page.Page = null;
 
-        // Go through and setup our rows.
-        var row_it = s.pages.rowIterator(
-            .right_down,
-            .{ .viewport = .{} },
-            null,
-        );
+        // Go through and setup our rows. We track the absolute row
+        // position so we can skip rows inside fold regions.
+        const viewport_offset = s.pages.viewportRowOffset();
+
+        // When fold regions exist, the viewport iterator must extend past
+        // the normal viewport bottom so that rows after folded regions can
+        // fill the remaining viewport positions. Without this, skipping N
+        // folded rows leaves N blank rows at the bottom.
+        const viewport_tl = s.pages.getTopLeft(.viewport);
+        const viewport_bl = if (s.fold_regions.items.len > 0)
+            s.pages.getBottomRight(.screen).?
+        else
+            s.pages.getBottomRight(.viewport).?;
+        var row_it = viewport_tl.rowIterator(.right_down, viewport_bl);
+        var abs_row: usize = viewport_offset;
         var y: size.CellCountInt = 0;
         var any_dirty: bool = false;
-        while (row_it.next()) |row_pin| : (y = y + 1) {
+        while (y < self.rows) {
+            const row_pin = row_it.next() orelse break;
+
+            // Skip folded rows — jump past the entire fold region at once.
+            // Folded rows are hidden from the viewport so we consume them
+            // from the iterator without assigning a viewport position.
+            if (s.foldAtRow(abs_row)) |fold| {
+                const to_skip = fold.end_row - abs_row;
+                var i: usize = 1; // already consumed one from row_it.next()
+                while (i < to_skip) : (i += 1) {
+                    if (row_it.next() == null) break;
+                }
+                abs_row = fold.end_row;
+                continue; // do NOT increment y
+            }
+
             // Find our cursor if we haven't found it yet. We do this even
             // if the row is not dirty because the cursor is unrelated.
             if (self.cursor.viewport == null and
@@ -449,6 +473,8 @@ pub const RenderState = struct {
                 if (page_rac.row.dirty) break :dirty;
 
                 // Not dirty!
+                abs_row += 1;
+                y += 1;
                 continue;
             }
 
@@ -461,8 +487,11 @@ pub const RenderState = struct {
 
             // Promote our arena. State is copied by value so we need to
             // restore it on all exit paths so we don't leak memory.
-            var arena = row_arenas[y].promote(alloc);
-            defer row_arenas[y] = arena.state;
+            // Capture y before any increment so the defer restores the
+            // correct row even when `continue` fires after `y += 1`.
+            const arena_y = y;
+            var arena = row_arenas[arena_y].promote(alloc);
+            defer row_arenas[arena_y] = arena.state;
 
             // Reset our cells if we're rebuilding this row.
             if (row_cells[y].len > 0) {
@@ -502,7 +531,11 @@ pub const RenderState = struct {
                 cells_slice.items(.raw),
                 page_cells,
             );
-            if (!page_rac.row.managedMemory()) continue;
+            if (!page_rac.row.managedMemory()) {
+                abs_row += 1;
+                y += 1;
+                continue;
+            }
 
             const arena_alloc = arena.allocator();
             const cells_grapheme = cells_slice.items(.grapheme);
@@ -549,8 +582,27 @@ pub const RenderState = struct {
                     },
                 }
             }
+
+            abs_row += 1;
+            y += 1;
         }
-        assert(y == self.rows);
+
+        // Clear remaining viewport positions that have no visible content
+        // due to folds reducing the number of visible rows below the
+        // viewport height. We mark them dirty with cleared cells so the
+        // renderer draws background color instead of stale content.
+        while (y < self.rows) : (y += 1) {
+            row_dirties[y] = true;
+            any_dirty = true;
+            if (row_cells[y].len > 0) {
+                var arena = row_arenas[y].promote(alloc);
+                _ = arena.reset(.retain_capacity);
+                row_arenas[y] = arena.state;
+                row_cells[y].clearRetainingCapacity();
+                row_sels[y] = null;
+                row_highlights[y] = .empty;
+            }
+        }
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
@@ -1461,4 +1513,143 @@ test "dirty row resets highlights" {
         const row_highlights = row_data.items(.highlights);
         try testing.expectEqual(0, row_highlights[0].items.len);
     }
+}
+
+// -----------------------------------------------------------------------
+// Fold rendering tests
+// -----------------------------------------------------------------------
+
+test "no fold baseline" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    try s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const row_data = state.row_data.slice();
+    try testing.expectEqual(@as(usize, 5), row_data.len);
+
+    const cells = row_data.items(.cells);
+    try testing.expectEqual('A', cells[0].get(0).raw.codepoint());
+    try testing.expectEqual('B', cells[1].get(0).raw.codepoint());
+    try testing.expectEqual('C', cells[2].get(0).raw.codepoint());
+    try testing.expectEqual('D', cells[3].get(0).raw.codepoint());
+    try testing.expectEqual('E', cells[4].get(0).raw.codepoint());
+}
+
+test "fold skips rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    try s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+
+    // Fold rows 1-3 hides "B" and "C" (end is exclusive)
+    try t.screens.active.addFold(1, 3);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const row_data = state.row_data.slice();
+    const cells = row_data.items(.cells);
+
+    // Row 0: "A" (before fold)
+    try testing.expectEqual('A', cells[0].get(0).raw.codepoint());
+    // Row 1: "D" (after fold, rows 1-2 skipped)
+    try testing.expectEqual('D', cells[1].get(0).raw.codepoint());
+    // Row 2: "E"
+    try testing.expectEqual('E', cells[2].get(0).raw.codepoint());
+    // Rows 3-4: should be cleared (no content after fold)
+    try testing.expectEqual(@as(usize, 0), cells[3].len);
+    try testing.expectEqual(@as(usize, 0), cells[4].len);
+}
+
+test "fold at end of viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    try s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+
+    // Fold the last 2 rows (3-4, hides "D")
+    try t.screens.active.addFold(3, 4);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const row_data = state.row_data.slice();
+    const cells = row_data.items(.cells);
+
+    try testing.expectEqual('A', cells[0].get(0).raw.codepoint());
+    try testing.expectEqual('B', cells[1].get(0).raw.codepoint());
+    try testing.expectEqual('C', cells[2].get(0).raw.codepoint());
+    // Row 3: "E" (skipped over fold)
+    try testing.expectEqual('E', cells[3].get(0).raw.codepoint());
+    // Row 4: cleared
+    try testing.expectEqual(@as(usize, 0), cells[4].len);
+}
+
+test "multiple folds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 10,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    // Write lines 0-9
+    try s.nextSlice("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9");
+
+    // Fold rows 1-3 (hides "1", "2") and rows 5-7 (hides "5", "6")
+    try t.screens.active.addFold(1, 3);
+    try t.screens.active.addFold(5, 7);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const row_data = state.row_data.slice();
+    const cells = row_data.items(.cells);
+
+    // Visible: 0, 3, 4, 7, 8, 9 (6 rows, then 4 blank)
+    try testing.expectEqual('0', cells[0].get(0).raw.codepoint());
+    try testing.expectEqual('3', cells[1].get(0).raw.codepoint());
+    try testing.expectEqual('4', cells[2].get(0).raw.codepoint());
+    try testing.expectEqual('7', cells[3].get(0).raw.codepoint());
+    try testing.expectEqual('8', cells[4].get(0).raw.codepoint());
+    try testing.expectEqual('9', cells[5].get(0).raw.codepoint());
+    // Remaining rows cleared
+    try testing.expectEqual(@as(usize, 0), cells[6].len);
+    try testing.expectEqual(@as(usize, 0), cells[7].len);
 }

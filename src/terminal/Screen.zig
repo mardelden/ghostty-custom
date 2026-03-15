@@ -43,6 +43,10 @@ pages: PageList,
 /// we can always have an active screen.
 no_scrollback: bool = false,
 
+/// Fold regions for collapsing large output. Sorted by start_row,
+/// non-overlapping. Row indices are absolute (0 = first scrollback row).
+fold_regions: std.ArrayListUnmanaged(FoldRegion) = .{},
+
 /// The current cursor position
 cursor: Cursor,
 
@@ -89,6 +93,24 @@ pub const Dirty = packed struct {
     /// When an OSC8 hyperlink is hovered, we set the full screen as dirty
     /// because links can span multiple lines.
     hyperlink_hover: bool = false,
+
+    /// Set when fold regions are added or removed, forcing a full
+    /// re-render so that folded/unfolded rows are displayed correctly.
+    folds: bool = false,
+};
+
+/// A fold region represents a range of rows that are collapsed/hidden
+/// in the viewport. Used by the app runtime to auto-collapse large
+/// command output. Row indices are absolute (0 = first row in scrollback).
+pub const FoldRegion = struct {
+    /// Absolute row index where fold starts (inclusive)
+    start_row: usize,
+    /// Absolute row index where fold ends (exclusive)
+    end_row: usize,
+
+    pub fn size(self: FoldRegion) usize {
+        return self.end_row - self.start_row;
+    }
 };
 
 pub const SemanticPrompt = struct {
@@ -322,8 +344,203 @@ pub fn deinit(self: *Screen) void {
     if (comptime build_options.kitty_graphics) {
         self.kitty_images.deinit(self.alloc, self);
     }
+    self.fold_regions.deinit(self.alloc);
     self.cursor.deinit(self.alloc);
     self.pages.deinit();
+}
+
+/// Add a fold region covering rows [start_row, end_row). The region
+/// must not overlap any existing fold. Keeps the list sorted by start_row.
+pub fn addFold(self: *Screen, start_row: usize, end_row: usize) Allocator.Error!void {
+    if (start_row >= end_row) return;
+
+    // Find insertion point (sorted by start_row).
+    var idx: usize = 0;
+    for (self.fold_regions.items) |existing| {
+        if (start_row < existing.end_row and end_row > existing.start_row) {
+            // Overlapping fold — ignore (caller should clear first)
+            return;
+        }
+        if (start_row < existing.start_row) break;
+        idx += 1;
+    }
+
+    try self.fold_regions.insert(self.alloc, idx, .{
+        .start_row = start_row,
+        .end_row = end_row,
+    });
+    self.dirty.folds = true;
+
+    // After adding a fold, reposition the viewport so pre-fold and
+    // post-fold content are both visible. Compute the fold-adjusted
+    // total: if all visible rows fit in the viewport, scroll to top.
+    // Otherwise, position the viewport at the fold-adjusted active area.
+    const adj = self.foldAdjustedScrollbar();
+    if (adj.total <= adj.len) {
+        // All visible content fits in the viewport — scroll to top
+        self.pages.scroll(.{ .top = {} });
+    } else {
+        // Viewport has less space than visible content. Reposition
+        // to the fold-adjusted active area (keeps cursor visible).
+        // adj.offset is the fold-adjusted viewport position — we need
+        // to convert it back to an absolute row by adding back folds
+        // that are above the target position.
+        var abs_target = adj.offset;
+        for (self.fold_regions.items) |f| {
+            if (f.start_row <= abs_target) {
+                abs_target += f.size();
+            } else {
+                break;
+            }
+        }
+        self.pages.scroll(.{ .row = abs_target });
+    }
+}
+
+/// Remove a fold region that matches [start_row, end_row) exactly.
+/// If no exact match, this is a no-op.
+pub fn removeFold(self: *Screen, start_row: usize, end_row: usize) void {
+    for (self.fold_regions.items, 0..) |existing, i| {
+        if (existing.start_row == start_row and existing.end_row == end_row) {
+            _ = self.fold_regions.orderedRemove(i);
+            self.dirty.folds = true;
+            return;
+        }
+    }
+}
+
+/// Remove any fold regions that overlap [start_row, end_row).
+pub fn removeFoldsInRange(self: *Screen, start_row: usize, end_row: usize) void {
+    var i: usize = 0;
+    var removed = false;
+    while (i < self.fold_regions.items.len) {
+        const f = self.fold_regions.items[i];
+        if (f.start_row < end_row and f.end_row > start_row) {
+            _ = self.fold_regions.orderedRemove(i);
+            removed = true;
+        } else {
+            i += 1;
+        }
+    }
+    if (removed) self.dirty.folds = true;
+}
+
+/// Clear all fold regions.
+pub fn clearFolds(self: *Screen) void {
+    if (self.fold_regions.items.len > 0) self.dirty.folds = true;
+    self.fold_regions.clearRetainingCapacity();
+}
+
+/// Return the total number of rows hidden by folds.
+pub fn totalFoldedRows(self: *const Screen) usize {
+    var total: usize = 0;
+    for (self.fold_regions.items) |f| {
+        total += f.size();
+    }
+    return total;
+}
+
+/// Return a scrollbar adjusted for fold regions. The total is reduced
+/// by the number of folded rows, and the offset is adjusted to account
+/// for folds above the viewport.
+pub fn foldAdjustedScrollbar(self: *Screen) PageList.Scrollbar {
+    var sb = self.pages.scrollbar();
+    const folded = self.totalFoldedRows();
+    if (folded == 0) return sb;
+
+    // Reduce total by folded rows
+    sb.total = if (sb.total > folded) sb.total - folded else sb.total;
+
+    // Adjust offset: subtract folds that are above the viewport position
+    const viewport_offset = sb.offset;
+    var folds_above: usize = 0;
+    for (self.fold_regions.items) |f| {
+        if (f.end_row <= viewport_offset) {
+            // Entire fold is above viewport
+            folds_above += f.size();
+        } else if (f.start_row < viewport_offset) {
+            // Fold partially above viewport
+            folds_above += viewport_offset - f.start_row;
+        }
+    }
+    sb.offset = if (sb.offset > folds_above) sb.offset - folds_above else 0;
+
+    return sb;
+}
+
+/// Check if an absolute row falls inside a fold region. Returns the
+/// fold region if found.
+pub fn foldAtRow(self: *const Screen, row: usize) ?FoldRegion {
+    for (self.fold_regions.items) |f| {
+        if (row >= f.start_row and row < f.end_row) return f;
+        if (f.start_row > row) break; // sorted, no need to continue
+    }
+    return null;
+}
+
+/// Map a visual row index (fold-adjusted, used by scrollbar) to a
+/// physical row index. Folds above the target visual row are added back.
+pub fn visualToPhysicalRow(self: *const Screen, visual_row: usize) usize {
+    if (self.fold_regions.items.len == 0) return visual_row;
+
+    var physical = visual_row;
+    for (self.fold_regions.items) |f| {
+        if (f.start_row <= physical) {
+            physical += f.size();
+        } else {
+            break;
+        }
+    }
+    return physical;
+}
+
+/// Convert a viewport-relative visual row (fold-adjusted, as seen on
+/// screen) to a viewport-relative physical row offset. Walks from the
+/// viewport top, skipping fold regions, until `visual_y` visible rows
+/// have been counted. Returns the physical row offset from viewport top.
+pub fn viewportVisualToPhysical(self: *Screen, visual_y: usize) usize {
+    if (self.fold_regions.items.len == 0) return visual_y;
+
+    const viewport_offset = self.pages.viewportRowOffset();
+    var abs_row = viewport_offset;
+    var counted: usize = 0;
+
+    while (counted < visual_y) {
+        if (self.foldAtRow(abs_row)) |fold| {
+            abs_row = fold.end_row;
+        } else {
+            counted += 1;
+            abs_row += 1;
+        }
+    }
+
+    // If we landed inside a fold, advance past it
+    if (self.foldAtRow(abs_row)) |fold| {
+        abs_row = fold.end_row;
+    }
+
+    return abs_row - viewport_offset;
+}
+
+/// After a delta_row scroll, if the viewport landed inside a fold
+/// region, jump past it in the scroll direction.
+fn fixupViewportFold(self: *Screen, delta: isize) void {
+    if (self.fold_regions.items.len == 0) return;
+
+    const offset = self.pages.viewportRowOffset();
+    if (self.foldAtRow(offset)) |fold| {
+        if (delta < 0) {
+            // Scrolling up: jump to just before the fold
+            if (fold.start_row > 0) {
+                self.pages.scroll(.{ .row = fold.start_row - 1 });
+            } else {
+                self.pages.scroll(.{ .top = {} });
+            }
+        } else {
+            // Scrolling down: jump to just after the fold
+            self.pages.scroll(.{ .row = fold.end_row });
+        }
+    }
 }
 
 /// Assert that the screen is in a consistent state. This doesn't check
@@ -395,6 +612,7 @@ pub fn reset(self: *Screen) void {
     self.protected_mode = .off;
     self.semantic_prompt = .disabled;
     self.clearSelection();
+    self.clearFolds();
 }
 
 /// Clone the screen.
@@ -1272,8 +1490,15 @@ pub inline fn scroll(self: *Screen, behavior: Scroll) void {
         .active => self.pages.scroll(.{ .active = {} }),
         .top => self.pages.scroll(.{ .top = {} }),
         .pin => |p| self.pages.scroll(.{ .pin = p }),
-        .row => |v| self.pages.scroll(.{ .row = v }),
-        .delta_row => |v| self.pages.scroll(.{ .delta_row = v }),
+        .row => |v| {
+            // Map visual row to physical row, accounting for folds
+            self.pages.scroll(.{ .row = self.visualToPhysicalRow(v) });
+        },
+        .delta_row => |v| {
+            self.pages.scroll(.{ .delta_row = v });
+            // After scroll, if viewport landed in a fold, skip past it
+            self.fixupViewportFold(v);
+        },
         .delta_prompt => |v| self.pages.scroll(.{ .delta_prompt = v }),
     }
 }
@@ -10349,4 +10574,293 @@ test "Screen: promptClickMove click right of input cursor on last char" {
 
     try testing.expectEqual(@as(usize, 1), result.right);
     try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+// -----------------------------------------------------------------------
+// Fold region tests
+// -----------------------------------------------------------------------
+
+test "Screen: addFold basic" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    // Write enough lines so fold rows exist in scrollback
+    for (0..30) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    try s.addFold(2, 5);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+    try testing.expectEqual(@as(usize, 2), s.fold_regions.items[0].start_row);
+    try testing.expectEqual(@as(usize, 5), s.fold_regions.items[0].end_row);
+    try testing.expectEqual(@as(usize, 3), s.fold_regions.items[0].size());
+    try testing.expect(s.dirty.folds);
+}
+
+test "Screen: addFold empty range rejected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    // start_row == end_row should be a no-op
+    try s.addFold(5, 5);
+    try testing.expectEqual(@as(usize, 0), s.fold_regions.items.len);
+
+    // start_row > end_row should be a no-op
+    try s.addFold(10, 5);
+    try testing.expectEqual(@as(usize, 0), s.fold_regions.items.len);
+}
+
+test "Screen: addFold overlap rejected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..30) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    try s.addFold(5, 10);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+
+    // Exact overlap
+    try s.addFold(5, 10);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+
+    // Partial overlap at start
+    try s.addFold(3, 7);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+
+    // Partial overlap at end
+    try s.addFold(8, 12);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+
+    // Contained inside existing
+    try s.addFold(6, 8);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+
+    // Surrounding existing
+    try s.addFold(3, 12);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+}
+
+test "Screen: addFold sorted insertion" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..50) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    // Add folds out of order
+    try s.addFold(20, 25);
+    try s.addFold(5, 10);
+    try s.addFold(30, 35);
+
+    try testing.expectEqual(@as(usize, 3), s.fold_regions.items.len);
+    // Should be sorted by start_row
+    try testing.expectEqual(@as(usize, 5), s.fold_regions.items[0].start_row);
+    try testing.expectEqual(@as(usize, 20), s.fold_regions.items[1].start_row);
+    try testing.expectEqual(@as(usize, 30), s.fold_regions.items[2].start_row);
+}
+
+test "Screen: removeFold exact match" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..30) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    try s.addFold(5, 10);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+
+    // Wrong range — no-op
+    s.removeFold(5, 8);
+    try testing.expectEqual(@as(usize, 1), s.fold_regions.items.len);
+
+    // Exact match removes it
+    s.removeFold(5, 10);
+    try testing.expectEqual(@as(usize, 0), s.fold_regions.items.len);
+    try testing.expect(s.dirty.folds);
+}
+
+test "Screen: removeFoldsInRange" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..50) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    try s.addFold(5, 10);
+    try s.addFold(15, 20);
+    try s.addFold(25, 30);
+    try testing.expectEqual(@as(usize, 3), s.fold_regions.items.len);
+
+    // Remove range that overlaps the middle fold
+    s.removeFoldsInRange(12, 22);
+    try testing.expectEqual(@as(usize, 2), s.fold_regions.items.len);
+    try testing.expectEqual(@as(usize, 5), s.fold_regions.items[0].start_row);
+    try testing.expectEqual(@as(usize, 25), s.fold_regions.items[1].start_row);
+
+    // Remove range that overlaps both remaining
+    s.removeFoldsInRange(0, 100);
+    try testing.expectEqual(@as(usize, 0), s.fold_regions.items.len);
+}
+
+test "Screen: foldAtRow" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..30) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    try s.addFold(5, 10);
+
+    // Inside fold region (inclusive start)
+    const f5 = s.foldAtRow(5);
+    try testing.expect(f5 != null);
+    try testing.expectEqual(@as(usize, 5), f5.?.start_row);
+    try testing.expectEqual(@as(usize, 10), f5.?.end_row);
+
+    // Middle of fold
+    const f7 = s.foldAtRow(7);
+    try testing.expect(f7 != null);
+    try testing.expectEqual(@as(usize, 5), f7.?.start_row);
+
+    // End is exclusive — row 10 is NOT in the fold
+    try testing.expect(s.foldAtRow(10) == null);
+
+    // Before fold
+    try testing.expect(s.foldAtRow(4) == null);
+
+    // Way past fold
+    try testing.expect(s.foldAtRow(20) == null);
+}
+
+test "Screen: totalFoldedRows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..50) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    try testing.expectEqual(@as(usize, 0), s.totalFoldedRows());
+
+    try s.addFold(5, 10); // 5 rows
+    try testing.expectEqual(@as(usize, 5), s.totalFoldedRows());
+
+    try s.addFold(20, 25); // 5 more rows
+    try testing.expectEqual(@as(usize, 10), s.totalFoldedRows());
+
+    try s.addFold(30, 32); // 2 more rows
+    try testing.expectEqual(@as(usize, 12), s.totalFoldedRows());
+}
+
+test "Screen: clearFolds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..30) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    try s.addFold(5, 10);
+    try s.addFold(15, 20);
+    try testing.expectEqual(@as(usize, 2), s.fold_regions.items.len);
+
+    s.dirty.folds = false;
+    s.clearFolds();
+    try testing.expectEqual(@as(usize, 0), s.fold_regions.items.len);
+    try testing.expect(s.dirty.folds);
+}
+
+test "Screen: foldAdjustedScrollbar no folds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 10, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    // Write enough to create scrollback
+    for (0..30) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    const raw_sb = s.pages.scrollbar();
+    const adj_sb = s.foldAdjustedScrollbar();
+
+    // With no folds, adjusted == raw
+    try testing.expectEqual(raw_sb.total, adj_sb.total);
+    try testing.expectEqual(raw_sb.offset, adj_sb.offset);
+    try testing.expectEqual(raw_sb.len, adj_sb.len);
+}
+
+test "Screen: foldAdjustedScrollbar with folds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 10, .max_scrollback = 1000 });
+    defer s.deinit();
+
+    for (0..30) |i| {
+        var buf: [8]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "L{d}\n", .{i}) catch unreachable;
+        try s.testWriteString(line);
+    }
+
+    const raw_sb = s.pages.scrollbar();
+
+    // Add a fold of 5 rows
+    try s.addFold(5, 10);
+    const adj_sb = s.foldAdjustedScrollbar();
+
+    // Total should be reduced by fold size
+    try testing.expectEqual(raw_sb.total - 5, adj_sb.total);
 }
